@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Local-first OPAML package manager prototype."""
+import argparse, json, re, shutil, sys, tomllib
+from pathlib import Path
+
+VERSION = "0.1.0"
+REGISTRY = Path(__file__).resolve().parent / "registry" / "packages"
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+class OpamlError(Exception): pass
+
+def valid_name(name):
+    if not NAME.fullmatch(name): raise OpamlError(f"invalid package name: {name!r}")
+
+def read_manifest(path=Path("opaml.toml")):
+    try:
+        with path.open("rb") as f: data = tomllib.load(f)
+    except FileNotFoundError: raise OpamlError(f"{path} not found; run 'opaml init'")
+    except (OSError, tomllib.TOMLDecodeError) as e: raise OpamlError(f"cannot read {path}: {e}")
+    if not isinstance(data.get("project", {}).get("name"), str):
+        raise OpamlError("opaml.toml must define [project] name")
+    deps = data.get("dependencies", {})
+    if not isinstance(deps, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k,v in deps.items()):
+        raise OpamlError("[dependencies] must map package names to version strings")
+    for name in deps: valid_name(name)
+    return data
+
+def write_manifest(data):
+    p = data["project"]
+    lines = ["[project]"]
+    for key in ("name", "version", "description", "ecosystem"):
+        if key in p: lines.append(f"{key} = {json.dumps(str(p[key]))}")
+    lines += ["", "[dependencies]"]
+    for n,v in sorted(data.get("dependencies", {}).items()): lines.append(f"{json.dumps(n)} = {json.dumps(v)}")
+    Path("opaml.toml").write_text("\n".join(lines)+"\n", encoding="utf-8")
+
+def metadata(name, version):
+    folder = REGISTRY / name / version
+    try:
+        with (folder / "package.toml").open("rb") as f: d = tomllib.load(f)
+    except FileNotFoundError: raise OpamlError(f"package {name}@{version} not found in local registry")
+    except (OSError, tomllib.TOMLDecodeError) as e: raise OpamlError(f"invalid metadata for {name}@{version}: {e}")
+    p = d.get("package", {})
+    if p.get("name") != name or str(p.get("version")) != version:
+        raise OpamlError(f"metadata identity mismatch for {name}@{version}")
+    deps = d.get("dependencies", {})
+    if not isinstance(deps, dict) or any(not isinstance(k,str) or not isinstance(v,str) for k,v in deps.items()):
+        raise OpamlError(f"invalid dependencies for {name}@{version}")
+    return {"name":name,"version":version,"path":folder,"dependencies":deps}
+
+def vkey(v):
+    return tuple((0,int(x)) if x.isdigit() else (1,x) for x in re.split(r"[.-]",v))
+
+def resolve(deps):
+    found, pending = {}, list(deps.items())
+    while pending:
+        name, wanted = pending.pop(0); valid_name(name)
+        if name in found:
+            if wanted not in ("*", found[name]["version"]):
+                raise OpamlError(f"version conflict for {name}: {found[name]['version']} vs {wanted}")
+            continue
+        root = REGISTRY / name
+        versions = sorted((p.name for p in root.iterdir() if p.is_dir()), key=vkey, reverse=True) if root.is_dir() else []
+        if wanted != "*": versions = [v for v in versions if v == wanted]
+        if not versions: raise OpamlError(f"no local registry version for {name} ({wanted})")
+        item = metadata(name, versions[0]); found[name] = item
+        pending.extend(item["dependencies"].items())
+    return found
+
+def cmd_init(a):
+    root=Path(a.path).resolve(); name=a.name or root.name; valid_name(name); root.mkdir(parents=True,exist_ok=True)
+    target=root/"opaml.toml"
+    if target.exists() and not a.force: raise OpamlError(f"{target} exists (use --force to replace)")
+    target.write_text(f'[project]\nname = {json.dumps(name)}\nversion = "0.1.0"\ndescription = "Liquid ecosystem project managed by OPAML"\n\n[dependencies]\n',encoding="utf-8")
+    print(f"Created {target}")
+
+def cmd_add(a):
+    valid_name(a.package); d=read_manifest(); d.setdefault("dependencies",{})[a.package]=a.version; write_manifest(d)
+    print(f"Added {a.package} = {json.dumps(a.version)}; run 'opaml install'.")
+
+def cmd_remove(a):
+    d=read_manifest()
+    if a.package not in d.get("dependencies",{}): raise OpamlError(f"{a.package} is not a direct dependency")
+    del d["dependencies"][a.package]; write_manifest(d); print(f"Removed {a.package}; run 'opaml install'.")
+
+def cmd_install(a):
+    root=Path.cwd(); d=read_manifest(root/"opaml.toml"); packages=resolve(d.get("dependencies",{}))
+    state=root/".opaml"; stage=state/"packages.new"; dest=state/"packages"
+    state.mkdir(exist_ok=True)
+    if stage.exists(): shutil.rmtree(stage)
+    stage.mkdir()
+    lock={"lockfile_version":1,"project":d["project"]["name"],"packages":{}}
+    try:
+        for name,item in sorted(packages.items()):
+            shutil.copytree(item["path"],stage/f'{name}-{item["version"]}',ignore=shutil.ignore_patterns("package.toml"),symlinks=False)
+            lock["packages"][name]={"version":item["version"]}
+        (root/"opaml.lock").write_text(json.dumps(lock,indent=2,sort_keys=True)+"\n",encoding="utf-8")
+        if dest.exists(): shutil.rmtree(dest)
+        stage.rename(dest)
+    except Exception:
+        if stage.exists(): shutil.rmtree(stage)
+        raise
+    print(f"Installed {len(packages)} package(s) from local registry; wrote opaml.lock.")
+
+def cmd_list(a):
+    deps=read_manifest().get("dependencies",{})
+    if not deps: print("No direct dependencies."); return
+    for n,v in sorted(deps.items()): print(f"{n} {v}")
+
+def cmd_verify(a):
+    d=read_manifest()
+    try: lock=json.loads(Path("opaml.lock").read_text(encoding="utf-8"))
+    except FileNotFoundError: raise OpamlError("opaml.lock missing; run 'opaml install'")
+    except (OSError,json.JSONDecodeError) as e: raise OpamlError(f"invalid opaml.lock: {e}")
+    if lock.get("project") != d["project"]["name"]: raise OpamlError("lockfile project name mismatch")
+    expected=resolve(d.get("dependencies",{})); actual=lock.get("packages",{})
+    if set(actual)!=set(expected) or any(actual.get(n,{}).get("version")!=m["version"] for n,m in expected.items()):
+        raise OpamlError("lockfile differs from manifest/registry; run 'opaml install'")
+    print(f"Verified {len(expected)} locked package(s).")
+
+def main():
+    p=argparse.ArgumentParser(prog="opaml",description="Local-first package manager for Liquid, LiquidWeb and Liquidsoap")
+    p.add_argument("--version",action="version",version=f"opaml {VERSION}")
+    s=p.add_subparsers(dest="cmd",required=True)
+    q=s.add_parser("init",help="create opaml.toml"); q.add_argument("path",nargs="?",default="."); q.add_argument("--name"); q.add_argument("--force",action="store_true"); q.set_defaults(run=cmd_init)
+    q=s.add_parser("add",help="add a local-registry dependency"); q.add_argument("package"); q.add_argument("--version",default="*"); q.set_defaults(run=cmd_add)
+    q=s.add_parser("remove",help="remove a dependency"); q.add_argument("package"); q.set_defaults(run=cmd_remove)
+    for command,helptext,func in [("install","resolve and install local packages",cmd_install),("list","list direct dependencies",cmd_list),("verify","verify lockfile consistency",cmd_verify)]:
+        s.add_parser(command,help=helptext).set_defaults(run=func)
+    a=p.parse_args()
+    try: a.run(a)
+    except OpamlError as e: print(f"opaml: error: {e}",file=sys.stderr); return 2
+    except OSError as e: print(f"opaml: filesystem error: {e}",file=sys.stderr); return 2
+    return 0
+if __name__=="__main__": raise SystemExit(main())
