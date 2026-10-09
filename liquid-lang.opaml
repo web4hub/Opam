@@ -1,0 +1,3 @@
+liquid install neural-network
+liquid install web-framework
+liquid update
