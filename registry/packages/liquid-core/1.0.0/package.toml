@@ -1,0 +1,4 @@
+name = "liquid-core"
+version = "1.0.0"
+description = "Example local package fixture for testing OPAML registry installation"
+license = "MIT"
