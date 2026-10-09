@@ -15,7 +15,7 @@ enum Command {
     /// Create a project in a new or existing directory.
     Init { name: String },
     /// Add a package requirement to opaml.toml.
-    Add { name: String, #[arg(long, default_value = "*")] version: String },
+    Add { name: String, version: String },
     /// Remove a package requirement from opaml.toml.
     Remove { name: String },
     /// Print declared dependencies.
@@ -111,7 +111,7 @@ fn list_dependencies() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn safe_component(value: &str) -> bool { valid_name(value) && value != "." && value != ".." }
+fn safe_version(value: &str) -> bool { !value.is_empty() && value.len() <= 100 && value != "." && value != ".." && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+')) }
 
 fn digest_tree(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let mut paths = Vec::new();
@@ -148,7 +148,7 @@ fn install() -> Result<(), Box<dyn std::error::Error>> {
     let mut locked = Vec::new();
 
     for (name, version) in &project.dependencies {
-        if !safe_component(name) || !safe_component(version) {
+        if !valid_name(name) || !safe_version(version) {
             return Err(format!("unsafe package name or version: {name} {version}").into());
         }
         let package_dir = registry.join(name).join(version);
@@ -188,7 +188,7 @@ fn verify() -> Result<(), Box<dyn std::error::Error>> {
     let lock: Lockfile = serde_json::from_str(&raw)?;
     let mut failures = 0usize;
     for package in lock.packages {
-        if !safe_component(&package.name) || !safe_component(&package.version) {
+        if !valid_name(&package.name) || !safe_version(&package.version) {
             return Err("lockfile contains an unsafe package path".into());
         }
         let installed = Path::new(".opaml/packages").join(&package.name).join(&package.version);
