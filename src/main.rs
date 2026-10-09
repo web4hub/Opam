@@ -186,6 +186,7 @@ fn verify() -> Result<(), Box<dyn std::error::Error>> {
     let raw = fs::read_to_string(LOCKFILE)
         .map_err(|e| io::Error::new(e.kind(), format!("cannot read {LOCKFILE}; run opaml install first: {e}")))?;
     let lock: Lockfile = serde_json::from_str(&raw)?;
+    if lock.lock_version != 1 { return Err(format!("unsupported lockfile version: {}", lock.lock_version).into()); }
     let mut failures = 0usize;
     for package in lock.packages {
         if !valid_name(&package.name) || !safe_version(&package.version) {
