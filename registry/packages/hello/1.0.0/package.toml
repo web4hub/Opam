@@ -1,0 +1,6 @@
+[package]
+name = "hello"
+version = "1.0.0"
+description = "Example local OPAML package"
+
+[dependencies]
